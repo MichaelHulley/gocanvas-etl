@@ -1,11 +1,21 @@
-import os
+# =========================================
+# GoCanvas ETL Script
+# Author: Michael Hulley
+# Date: 2026-03-17
+# Description:
+#   Loads GoCanvas submissions and responses
+#   into SQL Server staging and fact tables.
+# =========================================
+
 import json
-import requests
-import pyodbc
-from dotenv import load_dotenv
-from tqdm import tqdm
+import os
 from datetime import timedelta
+
+import pyodbc
+import requests
+from dotenv import load_dotenv
 from gocanvas_get_token import get_access_token
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -19,8 +29,17 @@ SQL_PASSWORD = os.getenv("SQL_PASSWORD")
 
 FORM_IDS = [
     5757557,
-    5525962, 5525968, 5612718, 5612894, 5648299,
-    5676079, 5679477, 5682489, 5686251, 5761346, 5771040
+    5525962,
+    5525968,
+    5612718,
+    5612894,
+    5648299,
+    5676079,
+    5679477,
+    5682489,
+    5686251,
+    5761346,
+    5771040,
 ]
 
 LIMIT = None
@@ -50,9 +69,7 @@ try:
     token = get_access_token()
     print("✅ Access token retrieved")
 
-    headers = {
-        "Authorization": f"Bearer {token}"
-    }
+    headers = {"Authorization": f"Bearer {token}"}
 
     # =========================
     # SQL CONNECTION
@@ -74,7 +91,8 @@ try:
     # =========================
     # START ETL LOG
     # =========================
-    cursor.execute("""
+    cursor.execute(
+        """
     INSERT INTO dbo.etl_run_log (
         process_name,
         started_at_utc,
@@ -82,7 +100,10 @@ try:
     )
     OUTPUT INSERTED.run_id
     VALUES (?, SYSUTCDATETIME(), ?)
-    """, PROCESS_NAME, "RUNNING")
+    """,
+        PROCESS_NAME,
+        "RUNNING",
+    )
 
     run_id = cursor.fetchone()[0]
     conn.commit()
@@ -123,11 +144,7 @@ try:
 
             while True:
                 url = f"{BASE_URL}/submissions"
-                params = {
-                    "form_id": form_id,
-                    "page": page,
-                    "per_page": 100
-                }
+                params = {"form_id": form_id, "page": page, "per_page": 100}
 
                 if created_after:
                     params["created_after"] = created_after
@@ -135,7 +152,9 @@ try:
                 response = session.get(url, params=params, timeout=60)
 
                 if response.status_code != 200:
-                    print(f"❌ Failed to fetch submissions for form {form_id}, status {response.status_code}")
+                    print(
+                        f"❌ Failed to fetch submissions for form {form_id}, status {response.status_code}"
+                    )
                     print(response.text[:300])
                     break
 
@@ -184,7 +203,8 @@ try:
         before_count = len(all_submissions)
 
         all_submissions = [
-            s for s in all_submissions
+            s
+            for s in all_submissions
             if s.get("created_at") and s["created_at"] > created_after
         ]
 
@@ -200,7 +220,8 @@ try:
     if not all_submissions:
         print("✅ No new submissions found. Nothing to do.")
 
-        cursor.execute("""
+        cursor.execute(
+            """
         UPDATE dbo.etl_run_log
         SET
             ended_at_utc = SYSUTCDATETIME(),
@@ -215,15 +236,15 @@ try:
             error_message = NULL
         WHERE run_id = ?
         """,
-        "SUCCESS",
-        submissions_fetched_count,
-        submissions_after_filter_count,
-        0,
-        submissions_inserted,
-        submissions_updated,
-        responses_inserted,
-        responses_updated,
-        run_id
+            "SUCCESS",
+            submissions_fetched_count,
+            submissions_after_filter_count,
+            0,
+            submissions_inserted,
+            submissions_updated,
+            responses_inserted,
+            responses_updated,
+            run_id,
         )
         conn.commit()
         raise SystemExit()
@@ -247,18 +268,21 @@ try:
 
     submission_rows = []
     for s in all_submissions:
-        submission_rows.append((
-            s.get("id"),
-            s.get("form_id"),
-            s.get("submission_number"),
-            s.get("submission_name"),
-            s.get("created_at"),
-            bool(s.get("revision", False)),
-            s.get("status", "completed")
-        ))
+        submission_rows.append(
+            (
+                s.get("id"),
+                s.get("form_id"),
+                s.get("submission_number"),
+                s.get("submission_name"),
+                s.get("created_at"),
+                bool(s.get("revision", False)),
+                s.get("status", "completed"),
+            )
+        )
 
     print("Loading submissions into temp table...")
-    cursor.executemany("""
+    cursor.executemany(
+        """
     INSERT INTO #submissions (
         submission_id,
         form_id,
@@ -269,7 +293,9 @@ try:
         status
     )
     VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, submission_rows)
+    """,
+        submission_rows,
+    )
     conn.commit()
 
     # =========================
@@ -357,7 +383,9 @@ try:
     submissions_inserted = submission_action_counts.get("INSERT", 0)
     submissions_updated = submission_action_counts.get("UPDATE", 0)
 
-    print(f"✅ Submissions merged | inserted={submissions_inserted}, updated={submissions_updated}")
+    print(
+        f"✅ Submissions merged | inserted={submissions_inserted}, updated={submissions_updated}"
+    )
 
     # =========================
     # FETCH SUBMISSION DETAILS / RESPONSES
@@ -372,7 +400,9 @@ try:
         response = session.get(url, timeout=60)
 
         if response.status_code != 200:
-            print(f"❌ Failed to fetch submission detail for submission {sub_id}, status {response.status_code}")
+            print(
+                f"❌ Failed to fetch submission detail for submission {sub_id}, status {response.status_code}"
+            )
             print(response.text[:200])
             continue
 
@@ -426,18 +456,20 @@ try:
             if not response_id:
                 continue
 
-            response_rows.append((
-                response_id,
-                sub_id,   # entry_id
-                sub_id,   # submission_id
-                form_id,
-                label,
-                value_text,
-                value_numeric,
-                value_date,
-                value_time,
-                displayed
-            ))
+            response_rows.append(
+                (
+                    response_id,
+                    sub_id,  # entry_id
+                    sub_id,  # submission_id
+                    form_id,
+                    label,
+                    value_text,
+                    value_numeric,
+                    value_date,
+                    value_time,
+                    displayed,
+                )
+            )
 
     responses_fetched_count = len(response_rows)
     print(f"✅ Total responses fetched: {responses_fetched_count}")
@@ -469,7 +501,8 @@ try:
     """)
 
     print("Loading responses into temp table...")
-    cursor.executemany("""
+    cursor.executemany(
+        """
     INSERT INTO #responses (
         response_id,
         entry_id,
@@ -483,7 +516,9 @@ try:
         displayed
     )
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, response_rows)
+    """,
+        response_rows,
+    )
     conn.commit()
 
     # =========================
@@ -586,7 +621,9 @@ try:
     responses_inserted = response_action_counts.get("INSERT", 0)
     responses_updated = response_action_counts.get("UPDATE", 0)
 
-    print(f"✅ Responses merged | inserted={responses_inserted}, updated={responses_updated}")
+    print(
+        f"✅ Responses merged | inserted={responses_inserted}, updated={responses_updated}"
+    )
 
     # =========================
     # RUN FACT LOAD
@@ -599,7 +636,8 @@ try:
     # =========================
     # UPDATE ETL LOG - SUCCESS
     # =========================
-    cursor.execute("""
+    cursor.execute(
+        """
     UPDATE dbo.etl_run_log
     SET
         ended_at_utc = SYSUTCDATETIME(),
@@ -614,15 +652,15 @@ try:
         error_message = NULL
     WHERE run_id = ?
     """,
-    "SUCCESS",
-    submissions_fetched_count,
-    submissions_after_filter_count,
-    responses_fetched_count,
-    submissions_inserted,
-    submissions_updated,
-    responses_inserted,
-    responses_updated,
-    run_id
+        "SUCCESS",
+        submissions_fetched_count,
+        submissions_after_filter_count,
+        responses_fetched_count,
+        submissions_inserted,
+        submissions_updated,
+        responses_inserted,
+        responses_updated,
+        run_id,
     )
     conn.commit()
     print("✅ ETL log updated")
@@ -632,7 +670,8 @@ except Exception as e:
 
     if cursor is not None and conn is not None and run_id is not None:
         try:
-            cursor.execute("""
+            cursor.execute(
+                """
             UPDATE dbo.etl_run_log
             SET
                 ended_at_utc = SYSUTCDATETIME(),
@@ -647,16 +686,16 @@ except Exception as e:
                 error_message = ?
             WHERE run_id = ?
             """,
-            "FAILED",
-            submissions_fetched_count,
-            submissions_after_filter_count,
-            responses_fetched_count,
-            submissions_inserted,
-            submissions_updated,
-            responses_inserted,
-            responses_updated,
-            str(e),
-            run_id
+                "FAILED",
+                submissions_fetched_count,
+                submissions_after_filter_count,
+                responses_fetched_count,
+                submissions_inserted,
+                submissions_updated,
+                responses_inserted,
+                responses_updated,
+                str(e),
+                run_id,
             )
             conn.commit()
             print("✅ ETL failure logged")
