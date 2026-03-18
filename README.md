@@ -24,152 +24,103 @@ GoCanvas_API/
 ├── .gitignore
 ├── requirements.txt
 └── README.md
-Main Components
+
+## Main Components
 etl/gc_get_forms.py
 
-Main ETL script. Handles:
-
-GoCanvas submission extraction
-
-response extraction
-
-incremental logic
-
-deduplication
-
-SQL staging loads
-
-MERGE operations
-
-ETL logging
-
-stored procedure execution
-
-etl/gocanvas_get_token.py
-
-Helper script that retrieves a valid GoCanvas OAuth token.
-
-Requirements
-
-Python 3.x
-
-SQL Server
-
-ODBC Driver 18 for SQL Server
-
-GoCanvas API credentials
-
-Python Packages
-
-Install dependencies with:
-
-pip install -r requirements.txt
-
-Typical packages used:
-
-requests
-
-pyodbc
-
-python-dotenv
-
-tqdm
-
-Environment Variables
-
-Create a .env file in the project root.
-
-Example:
-
-SQL_SERVER=192.168.1.2,1433
-SQL_DB=KNIGHTSHADE_MGT
-SQL_USER=your_sql_username
-SQL_PASSWORD=your_sql_password
-
-GOCANVAS_CLIENT_ID=your_client_id
-GOCANVAS_CLIENT_SECRET=your_client_secret
-SQL Dependencies
-
-The script expects the following database objects to exist:
-
-dbo.stg_gocanvas_submission
-
-dbo.stg_gocanvas_response
-
-dbo.etl_run_log
-
-dbo.usp_load_fact_tomato_intake
-
-How It Works
-Incremental Load
-
-The script checks:
-
-SELECT MAX(created_at_utc)
-FROM dbo.stg_gocanvas_submission
-
-It then applies:
-
-a 1-day lookback window
-
-Python-side filtering after fetch
-
-deduplication before load
-
-This makes the pipeline safer against late-arriving records and API inconsistencies.
-
-Submission and Response Loading
-
-The script:
-
-stages data in temp tables
-
-performs set-based MERGE operations into staging
-
-captures insert/update counts using OUTPUT $action
-
-ETL Logging
-
-Each run is logged to:
-
-dbo.etl_run_log
-
-Captured fields include:
-
-process name
-
-start/end time
-
-status
-
-submissions fetched
-
-submissions after filter
-
-responses fetched
-
-insert/update counts
-
-error message on failure
-
-Running the Script
-
-From the repo root:
-
-python etl/gc_get_forms.py
-Branching Strategy
-
-main = stable / production-ready code
-
-dev = active development and testing
-
-Typical workflow:
-
-git checkout dev
-# make changes
-git add .
-git commit -m "Describe change"
-git push
+## Main ETL script. Handles:
+
+1. GoCanvas submission extraction
+2. response extraction
+3. incremental logic
+4. deduplication
+5. SQL staging loads
+6. MERGE operations
+7. ETL logging
+8. stored procedure execution
+
+### etl/gocanvas_get_token.py
+### Helper script that retrieves a valid GoCanvas OAuth token.
+
+## Requirements
+
+1. Python 3.x
+2. SQL Server
+3. ODBC Driver 18 for SQL Server
+4. GoCanvas API credentials
+
+## Python Packages
+
+1. Install dependencies with:
+      pip install -r requirements.txt
+2. Typical packages used:
+    requests
+    pyodbc
+    python-dotenv
+    tqdm
+3. Environment Variables
+    Create a .env file in the project root.
+    Example:
+        SQL_SERVER=192.168.1.2,1433
+        SQL_DB=KNIGHTSHADE_MGT
+        SQL_USER=your_sql_username
+        SQL_PASSWORD=your_sql_password
+        GOCANVAS_CLIENT_ID=your_client_id
+        GOCANVAS_CLIENT_SECRET=your_client_secret
+
+4. SQL Dependencies
+    The script expects the following database objects to exist:
+        1. dbo.stg_gocanvas_submission
+        2. dbo.stg_gocanvas_response
+        3. dbo.etl_run_log
+        4. dbo.usp_load_fact_tomato_intake
+
+5. How It Works
+    Incremental Load
+    The script checks:
+        SELECT MAX(created_at_utc)
+        FROM dbo.stg_gocanvas_submission
+
+    It then applies:
+        a 1-day lookback window
+        Python-side filtering after fetch
+        deduplication before load
+        This makes the pipeline safer against late-arriving records and API inconsistencies.
+        Submission and Response Loading
+
+    The script:
+        stages data in temp tables
+        performs set-based MERGE operations into staging
+        captures insert/update counts using OUTPUT $action
+        ETL Logging
+
+    Each run is logged to:
+        dbo.etl_run_log
+
+    Captured fields include:
+        process name
+        start/end time
+        status
+        submissions fetched
+        submissions after filter
+        responses fetched
+        insert/update counts
+        error message on failure
+        
+## Running the Script
+    From the repo root:
+        python etl/gc_get_forms.py
+    Branching Strategy
+        main = stable / production-ready code
+        dev = active development and testing
+
+## Typical workflow:
+    git checkout dev
+
+    # make changes
+    git add .
+    git commit -m "Describe change"
+    git push
 
 When ready to promote:
 
