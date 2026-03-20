@@ -13,3 +13,6 @@ venv/
 
 # Dev / temp
 *.json
+
+# VS Code
+*.log

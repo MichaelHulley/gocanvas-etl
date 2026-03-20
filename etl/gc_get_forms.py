@@ -1,10 +1,12 @@
 # =========================================
 # GoCanvas ETL Script
 # Author: Michael Hulley
-# Date: 2026-03-17
+# Date: 2026-03-20
 # Description:
-#   Loads GoCanvas submissions and responses
-#   into SQL Server staging and fact tables.
+#   Extracts GoCanvas submissions and responses
+#   and loads RAW data into SQL Server staging tables.
+#   All transformations (mapping, pivoting, fact loading)
+#   are handled in SQL Server stored procedures/views.
 # =========================================
 
 import json
@@ -27,24 +29,33 @@ SQL_DB = os.getenv("SQL_DB") or os.getenv("SQL_DATABASE")
 SQL_USER = os.getenv("SQL_USER") or os.getenv("SQL_USERNAME")
 SQL_PASSWORD = os.getenv("SQL_PASSWORD")
 
-FORM_IDS = [
-    5757557,
-    5525962,
-    5525968,
-    5612718,
-    5612894,
-    5648299,
-    5676079,
-    5679477,
-    5682489,
-    5686251,
-    5761346,
-    5771040,
-]
+FORM_IDS = sorted(
+    {
+        5757557,
+        5525962,
+        5525968,
+        5612718,
+        5612894,
+        5648299,
+        5676079,
+        5679477,
+        5682489,
+        5686251,
+        5761346,
+        5771040,
+        5356418,
+        5500213,
+        5404597,
+    }
+)
 
 LIMIT = None
 BASE_URL = "https://www.gocanvas.com/api/v3"
 PROCESS_NAME = "tomato_intake"
+FACT_PROC = "dbo.usp_load_fact_tomato_intake"
+
+# Set True temporarily if you want to inspect response keys
+DEBUG_RESPONSE_KEYS = False
 
 # =========================
 # COUNTERS FOR LOGGING
@@ -93,14 +104,14 @@ try:
     # =========================
     cursor.execute(
         """
-    INSERT INTO dbo.etl_run_log (
-        process_name,
-        started_at_utc,
-        status
-    )
-    OUTPUT INSERTED.run_id
-    VALUES (?, SYSUTCDATETIME(), ?)
-    """,
+        INSERT INTO dbo.etl_run_log (
+            process_name,
+            started_at_utc,
+            status
+        )
+        OUTPUT INSERTED.run_id
+        VALUES (?, SYSUTCDATETIME(), ?)
+        """,
         PROCESS_NAME,
         "RUNNING",
     )
@@ -112,10 +123,12 @@ try:
     # =========================
     # LAST LOAD TIME
     # =========================
-    cursor.execute("""
-    SELECT MAX(created_at_utc)
-    FROM dbo.stg_gocanvas_submission
-    """)
+    cursor.execute(
+        """
+        SELECT MAX(created_at_utc)
+        FROM dbo.stg_gocanvas_submission
+        """
+    )
     last_run = cursor.fetchone()[0]
 
     if last_run:
@@ -197,6 +210,7 @@ try:
 
     # =========================
     # PYTHON-SIDE INCREMENTAL FILTER
+    # Safety filter in case API returns rows slightly outside window
     # =========================
     if last_run:
         print("Applying Python-side incremental filter...")
@@ -222,20 +236,20 @@ try:
 
         cursor.execute(
             """
-        UPDATE dbo.etl_run_log
-        SET
-            ended_at_utc = SYSUTCDATETIME(),
-            status = ?,
-            submissions_fetched = ?,
-            submissions_after_filter = ?,
-            responses_fetched = ?,
-            submissions_inserted = ?,
-            submissions_updated = ?,
-            responses_inserted = ?,
-            responses_updated = ?,
-            error_message = NULL
-        WHERE run_id = ?
-        """,
+            UPDATE dbo.etl_run_log
+            SET
+                ended_at_utc = SYSUTCDATETIME(),
+                status = ?,
+                submissions_fetched = ?,
+                submissions_after_filter = ?,
+                responses_fetched = ?,
+                submissions_inserted = ?,
+                submissions_updated = ?,
+                responses_inserted = ?,
+                responses_updated = ?,
+                error_message = NULL
+            WHERE run_id = ?
+            """,
             "SUCCESS",
             submissions_fetched_count,
             submissions_after_filter_count,
@@ -252,19 +266,21 @@ try:
     # =========================
     # LOAD SUBMISSIONS TO TEMP TABLE
     # =========================
-    cursor.execute("""
-    IF OBJECT_ID('tempdb..#submissions') IS NOT NULL DROP TABLE #submissions;
+    cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#submissions') IS NOT NULL DROP TABLE #submissions;
 
-    CREATE TABLE #submissions (
-        submission_id BIGINT NOT NULL,
-        form_id BIGINT NULL,
-        submission_number NVARCHAR(100) NULL,
-        submission_name NVARCHAR(255) NULL,
-        created_at_utc DATETIME2 NULL,
-        revision BIT NOT NULL,
-        status NVARCHAR(50) NULL
-    );
-    """)
+        CREATE TABLE #submissions (
+            submission_id BIGINT NOT NULL,
+            form_id BIGINT NULL,
+            submission_number NVARCHAR(100) NULL,
+            submission_name NVARCHAR(255) NULL,
+            created_at_utc DATETIME2 NULL,
+            revision BIT NOT NULL,
+            status NVARCHAR(50) NULL
+        );
+        """
+    )
 
     submission_rows = []
     for s in all_submissions:
@@ -283,17 +299,17 @@ try:
     print("Loading submissions into temp table...")
     cursor.executemany(
         """
-    INSERT INTO #submissions (
-        submission_id,
-        form_id,
-        submission_number,
-        submission_name,
-        created_at_utc,
-        revision,
-        status
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    """,
+        INSERT INTO #submissions (
+            submission_id,
+            form_id,
+            submission_number,
+            submission_name,
+            created_at_utc,
+            revision,
+            status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
         submission_rows,
     )
     conn.commit()
@@ -303,81 +319,87 @@ try:
     # =========================
     print("Merging submissions into stg_gocanvas_submission...")
 
-    cursor.execute("""
-    IF OBJECT_ID('tempdb..#submission_merge_actions') IS NOT NULL DROP TABLE #submission_merge_actions;
+    cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#submission_merge_actions') IS NOT NULL DROP TABLE #submission_merge_actions;
 
-    CREATE TABLE #submission_merge_actions (
-        action_name NVARCHAR(10)
-    );
-    """)
-
-    cursor.execute("""
-    ;WITH src AS (
-        SELECT
-            submission_id,
-            form_id,
-            submission_number,
-            submission_name,
-            created_at_utc,
-            revision,
-            status,
-            ROW_NUMBER() OVER (
-                PARTITION BY submission_id
-                ORDER BY created_at_utc DESC, form_id DESC
-            ) AS rn
-        FROM #submissions
-    ),
-    deduped AS (
-        SELECT
-            submission_id,
-            form_id,
-            submission_number,
-            submission_name,
-            created_at_utc,
-            revision,
-            status
-        FROM src
-        WHERE rn = 1
+        CREATE TABLE #submission_merge_actions (
+            action_name NVARCHAR(10)
+        );
+        """
     )
-    MERGE dbo.stg_gocanvas_submission AS tgt
-    USING deduped AS src
-        ON tgt.submission_id = src.submission_id
-    WHEN MATCHED THEN
-        UPDATE SET
-            form_id = src.form_id,
-            submission_number = src.submission_number,
-            submission_name = src.submission_name,
-            created_at_utc = src.created_at_utc,
-            revision = src.revision,
-            status = src.status
-    WHEN NOT MATCHED THEN
-        INSERT (
-            submission_id,
-            form_id,
-            submission_number,
-            submission_name,
-            created_at_utc,
-            revision,
-            status
+
+    cursor.execute(
+        """
+        ;WITH src AS (
+            SELECT
+                submission_id,
+                form_id,
+                submission_number,
+                submission_name,
+                created_at_utc,
+                revision,
+                status,
+                ROW_NUMBER() OVER (
+                    PARTITION BY submission_id
+                    ORDER BY created_at_utc DESC, form_id DESC
+                ) AS rn
+            FROM #submissions
+        ),
+        deduped AS (
+            SELECT
+                submission_id,
+                form_id,
+                submission_number,
+                submission_name,
+                created_at_utc,
+                revision,
+                status
+            FROM src
+            WHERE rn = 1
         )
-        VALUES (
-            src.submission_id,
-            src.form_id,
-            src.submission_number,
-            src.submission_name,
-            src.created_at_utc,
-            src.revision,
-            src.status
-        )
-    OUTPUT $action INTO #submission_merge_actions(action_name);
-    """)
+        MERGE dbo.stg_gocanvas_submission AS tgt
+        USING deduped AS src
+            ON tgt.submission_id = src.submission_id
+        WHEN MATCHED THEN
+            UPDATE SET
+                form_id = src.form_id,
+                submission_number = src.submission_number,
+                submission_name = src.submission_name,
+                created_at_utc = src.created_at_utc,
+                revision = src.revision,
+                status = src.status
+        WHEN NOT MATCHED THEN
+            INSERT (
+                submission_id,
+                form_id,
+                submission_number,
+                submission_name,
+                created_at_utc,
+                revision,
+                status
+            )
+            VALUES (
+                src.submission_id,
+                src.form_id,
+                src.submission_number,
+                src.submission_name,
+                src.created_at_utc,
+                src.revision,
+                src.status
+            )
+        OUTPUT $action INTO #submission_merge_actions(action_name);
+        """
+    )
     conn.commit()
 
-    cursor.execute("""
-    SELECT action_name, COUNT(*)
-    FROM #submission_merge_actions
-    GROUP BY action_name
-    """)
+    cursor.execute(
+        """
+        SELECT action_name, COUNT(*)
+        FROM #submission_merge_actions
+        GROUP BY action_name
+        """
+    )
     submission_action_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
     submissions_inserted = submission_action_counts.get("INSERT", 0)
@@ -391,6 +413,7 @@ try:
     # FETCH SUBMISSION DETAILS / RESPONSES
     # =========================
     response_rows = []
+    debug_keys_logged = False
 
     print("Fetching submission details / responses...")
     for s in tqdm(all_submissions, desc="Responses", unit="submission"):
@@ -421,16 +444,35 @@ try:
         else:
             responses = []
 
+        if DEBUG_RESPONSE_KEYS and responses and not debug_keys_logged:
+            sample = responses[0]
+            if isinstance(sample, str):
+                sample = json.loads(sample)
+            print("DEBUG response keys:", sorted(sample.keys()))
+            debug_keys_logged = True
+
         for r in responses:
             if isinstance(r, str):
                 r = json.loads(r)
+
+            response_id = r.get("id")
+            label = r.get("label")
+
+            field_type = r.get("field_type")
+            export_label = r.get("export_label")
+            displayed = r.get("displayed")
+
+            if isinstance(displayed, (list, dict)):
+                displayed = None
 
             value_text = r.get("value_text")
             if value_text is None:
                 value_text = r.get("value")
 
+            value_json = None
             if isinstance(value_text, (list, dict)):
-                value_text = json.dumps(value_text, ensure_ascii=False)
+                value_json = json.dumps(value_text, ensure_ascii=False)
+                value_text = value_json
             elif value_text is not None:
                 value_text = str(value_text)
 
@@ -446,12 +488,11 @@ try:
             if isinstance(value_time, (list, dict)):
                 value_time = None
 
-            displayed = r.get("displayed")
-            if isinstance(displayed, (list, dict)):
-                displayed = None
-
-            response_id = r.get("id")
-            label = r.get("label")
+            multi_key = None
+            for key_name in ("multi_key", "key", "field_key", "name"):
+                if r.get(key_name) is not None:
+                    multi_key = str(r.get(key_name))
+                    break
 
             if not response_id:
                 continue
@@ -459,22 +500,26 @@ try:
             response_rows.append(
                 (
                     response_id,
-                    sub_id,  # entry_id
                     sub_id,  # submission_id
                     form_id,
+                    sub_id,  # entry_id
+                    field_type,
                     label,
+                    export_label,
+                    displayed,
                     value_text,
                     value_numeric,
                     value_date,
                     value_time,
-                    displayed,
+                    value_json,
+                    multi_key,
                 )
             )
 
     responses_fetched_count = len(response_rows)
     print(f"✅ Total responses fetched: {responses_fetched_count}")
 
-    bad_rows = [row for row in response_rows if row[3] is None]
+    bad_rows = [row for row in response_rows if row[2] is None]
     if bad_rows:
         print(f"❌ Found {len(bad_rows)} response rows with NULL form_id")
         print("Sample bad row:", bad_rows[0])
@@ -483,40 +528,52 @@ try:
     # =========================
     # LOAD RESPONSES TO TEMP TABLE
     # =========================
-    cursor.execute("""
-    IF OBJECT_ID('tempdb..#responses') IS NOT NULL DROP TABLE #responses;
+    cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#responses') IS NOT NULL DROP TABLE #responses;
 
-    CREATE TABLE #responses (
-        response_id BIGINT NOT NULL,
-        entry_id BIGINT NOT NULL,
-        submission_id BIGINT NOT NULL,
-        form_id BIGINT NOT NULL,
-        label NVARCHAR(255) NULL,
-        value_text NVARCHAR(MAX) NULL,
-        value_numeric DECIMAL(18,3) NULL,
-        value_date DATE NULL,
-        value_time TIME NULL,
-        displayed BIT NULL
-    );
-    """)
+        CREATE TABLE #responses (
+            response_id BIGINT NOT NULL,
+            submission_id BIGINT NOT NULL,
+            form_id INT NOT NULL,
+            entry_id BIGINT NOT NULL,
+            field_type NVARCHAR(50) NULL,
+            label NVARCHAR(255) NULL,
+            export_label NVARCHAR(255) NULL,
+            displayed BIT NULL,
+            value_text NVARCHAR(MAX) NULL,
+            value_numeric DECIMAL(18,6) NULL,
+            value_date DATE NULL,
+            value_time TIME(0) NULL,
+            value_json NVARCHAR(MAX) NULL,
+            loaded_at_utc DATETIME2(0) NOT NULL,
+            multi_key VARCHAR(50) NULL
+        );
+        """
+    )
 
     print("Loading responses into temp table...")
     cursor.executemany(
         """
-    INSERT INTO #responses (
-        response_id,
-        entry_id,
-        submission_id,
-        form_id,
-        label,
-        value_text,
-        value_numeric,
-        value_date,
-        value_time,
-        displayed
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """,
+        INSERT INTO #responses (
+            response_id,
+            submission_id,
+            form_id,
+            entry_id,
+            field_type,
+            label,
+            export_label,
+            displayed,
+            value_text,
+            value_numeric,
+            value_date,
+            value_time,
+            value_json,
+            loaded_at_utc,
+            multi_key
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, SYSUTCDATETIME(), ?)
+        """,
         response_rows,
     )
     conn.commit()
@@ -526,96 +583,127 @@ try:
     # =========================
     print("Merging responses into stg_gocanvas_response...")
 
-    cursor.execute("""
-    IF OBJECT_ID('tempdb..#response_merge_actions') IS NOT NULL DROP TABLE #response_merge_actions;
+    cursor.execute(
+        """
+        IF OBJECT_ID('tempdb..#response_merge_actions') IS NOT NULL DROP TABLE #response_merge_actions;
 
-    CREATE TABLE #response_merge_actions (
-        action_name NVARCHAR(10)
-    );
-    """)
-
-    cursor.execute("""
-    ;WITH src AS (
-        SELECT
-            response_id,
-            entry_id,
-            submission_id,
-            form_id,
-            label,
-            value_text,
-            value_numeric,
-            value_date,
-            value_time,
-            displayed,
-            ROW_NUMBER() OVER (
-                PARTITION BY response_id
-                ORDER BY submission_id DESC
-            ) AS rn
-        FROM #responses
-    ),
-    deduped AS (
-        SELECT
-            response_id,
-            entry_id,
-            submission_id,
-            form_id,
-            label,
-            value_text,
-            value_numeric,
-            value_date,
-            value_time,
-            displayed
-        FROM src
-        WHERE rn = 1
+        CREATE TABLE #response_merge_actions (
+            action_name NVARCHAR(10)
+        );
+        """
     )
-    MERGE dbo.stg_gocanvas_response AS tgt
-    USING deduped AS src
-        ON tgt.response_id = src.response_id
-    WHEN MATCHED THEN
-        UPDATE SET
-            entry_id = src.entry_id,
-            submission_id = src.submission_id,
-            form_id = src.form_id,
-            label = src.label,
-            value_text = src.value_text,
-            value_numeric = src.value_numeric,
-            value_date = src.value_date,
-            value_time = src.value_time,
-            displayed = src.displayed
-    WHEN NOT MATCHED THEN
-        INSERT (
-            response_id,
-            entry_id,
-            submission_id,
-            form_id,
-            label,
-            value_text,
-            value_numeric,
-            value_date,
-            value_time,
-            displayed
+
+    cursor.execute(
+        """
+        ;WITH src AS (
+            SELECT
+                response_id,
+                submission_id,
+                form_id,
+                entry_id,
+                field_type,
+                label,
+                export_label,
+                displayed,
+                value_text,
+                value_numeric,
+                value_date,
+                value_time,
+                value_json,
+                loaded_at_utc,
+                multi_key,
+                ROW_NUMBER() OVER (
+                    PARTITION BY response_id
+                    ORDER BY submission_id DESC
+                ) AS rn
+            FROM #responses
+        ),
+        deduped AS (
+            SELECT
+                response_id,
+                submission_id,
+                form_id,
+                entry_id,
+                field_type,
+                label,
+                export_label,
+                displayed,
+                value_text,
+                value_numeric,
+                value_date,
+                value_time,
+                value_json,
+                loaded_at_utc,
+                multi_key
+            FROM src
+            WHERE rn = 1
         )
-        VALUES (
-            src.response_id,
-            src.entry_id,
-            src.submission_id,
-            src.form_id,
-            src.label,
-            src.value_text,
-            src.value_numeric,
-            src.value_date,
-            src.value_time,
-            src.displayed
-        )
-    OUTPUT $action INTO #response_merge_actions(action_name);
-    """)
+        MERGE dbo.stg_gocanvas_response AS tgt
+        USING deduped AS src
+            ON tgt.response_id = src.response_id
+        WHEN MATCHED THEN
+            UPDATE SET
+                submission_id = src.submission_id,
+                form_id = src.form_id,
+                entry_id = src.entry_id,
+                field_type = src.field_type,
+                label = src.label,
+                export_label = src.export_label,
+                displayed = src.displayed,
+                value_text = src.value_text,
+                value_numeric = src.value_numeric,
+                value_date = src.value_date,
+                value_time = src.value_time,
+                value_json = src.value_json,
+                loaded_at_utc = src.loaded_at_utc,
+                multi_key = src.multi_key
+        WHEN NOT MATCHED THEN
+            INSERT (
+                response_id,
+                submission_id,
+                form_id,
+                entry_id,
+                field_type,
+                label,
+                export_label,
+                displayed,
+                value_text,
+                value_numeric,
+                value_date,
+                value_time,
+                value_json,
+                loaded_at_utc,
+                multi_key
+            )
+            VALUES (
+                src.response_id,
+                src.submission_id,
+                src.form_id,
+                src.entry_id,
+                src.field_type,
+                src.label,
+                src.export_label,
+                src.displayed,
+                src.value_text,
+                src.value_numeric,
+                src.value_date,
+                src.value_time,
+                src.value_json,
+                src.loaded_at_utc,
+                src.multi_key
+            )
+        OUTPUT $action INTO #response_merge_actions(action_name);
+        """
+    )
     conn.commit()
 
-    cursor.execute("""
-    SELECT action_name, COUNT(*)
-    FROM #response_merge_actions
-    GROUP BY action_name
-    """)
+    cursor.execute(
+        """
+        SELECT action_name, COUNT(*)
+        FROM #response_merge_actions
+        GROUP BY action_name
+        """
+    )
     response_action_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
     responses_inserted = response_action_counts.get("INSERT", 0)
@@ -628,8 +716,8 @@ try:
     # =========================
     # RUN FACT LOAD
     # =========================
-    print("Running stored procedure: usp_load_fact_tomato_intake...")
-    cursor.execute("EXEC dbo.usp_load_fact_tomato_intake")
+    print(f"Running stored procedure: {FACT_PROC}...")
+    cursor.execute(f"EXEC {FACT_PROC}")
     conn.commit()
     print("✅ Stored procedure executed successfully")
 
@@ -638,20 +726,20 @@ try:
     # =========================
     cursor.execute(
         """
-    UPDATE dbo.etl_run_log
-    SET
-        ended_at_utc = SYSUTCDATETIME(),
-        status = ?,
-        submissions_fetched = ?,
-        submissions_after_filter = ?,
-        responses_fetched = ?,
-        submissions_inserted = ?,
-        submissions_updated = ?,
-        responses_inserted = ?,
-        responses_updated = ?,
-        error_message = NULL
-    WHERE run_id = ?
-    """,
+        UPDATE dbo.etl_run_log
+        SET
+            ended_at_utc = SYSUTCDATETIME(),
+            status = ?,
+            submissions_fetched = ?,
+            submissions_after_filter = ?,
+            responses_fetched = ?,
+            submissions_inserted = ?,
+            submissions_updated = ?,
+            responses_inserted = ?,
+            responses_updated = ?,
+            error_message = NULL
+        WHERE run_id = ?
+        """,
         "SUCCESS",
         submissions_fetched_count,
         submissions_after_filter_count,
@@ -672,20 +760,20 @@ except Exception as e:
         try:
             cursor.execute(
                 """
-            UPDATE dbo.etl_run_log
-            SET
-                ended_at_utc = SYSUTCDATETIME(),
-                status = ?,
-                submissions_fetched = ?,
-                submissions_after_filter = ?,
-                responses_fetched = ?,
-                submissions_inserted = ?,
-                submissions_updated = ?,
-                responses_inserted = ?,
-                responses_updated = ?,
-                error_message = ?
-            WHERE run_id = ?
-            """,
+                UPDATE dbo.etl_run_log
+                SET
+                    ended_at_utc = SYSUTCDATETIME(),
+                    status = ?,
+                    submissions_fetched = ?,
+                    submissions_after_filter = ?,
+                    responses_fetched = ?,
+                    submissions_inserted = ?,
+                    submissions_updated = ?,
+                    responses_inserted = ?,
+                    responses_updated = ?,
+                    error_message = ?
+                WHERE run_id = ?
+                """,
                 "FAILED",
                 submissions_fetched_count,
                 submissions_after_filter_count,
