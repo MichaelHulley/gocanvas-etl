@@ -1,18 +1,6 @@
 # =========================================
 # GoCanvas ETL Script
-# Author: Michael Hulley
-# Date: 2026-03-27
-# Description:
-#   Extracts GoCanvas submissions and responses
-#   for all active forms assigned to this ETL process
-#   in dbo.gocanvas_form_registry, and loads RAW data into:
-#       dbo.stg_gocanvas_submission
-#       dbo.stg_gocanvas_response
-#
-#   Notes:
-#   - Uses per-form incremental loading
-#   - Uses exact form_id filtering after API fetch
-#   - Does NOT run a post-load stored procedure by default
+# Rewritten core sections for safer loading
 # =========================================
 
 import json
@@ -36,10 +24,31 @@ SQL_USER = os.getenv("SQL_USER") or os.getenv("SQL_USERNAME")
 SQL_PASSWORD = os.getenv("SQL_PASSWORD")
 
 BASE_URL = "https://www.gocanvas.com/api/v3"
-PROCESS_NAME = "gc_get_forms.py"
-FACT_PROC = None
+PROCESS_NAME = "gc_get_forms"
+FACT_PROC = "dbo.usp_gocanvas_stage_to_fact" #dbo.usp_load_fact_tomato_intake
 LIMIT = None
-DEBUG_RESPONSE_KEYS = False
+DEBUG_RESPONSE_KEYS = True
+
+FORM_IDS = sorted(
+    {
+      #  5757557,
+      #  5525962,
+      #  5525968,
+      #  5612718,
+      #  5612894,
+      #  5648299,
+      #  5676079,
+      #  5679477,
+      #  5682489,
+      #  5686251,
+        5700339,  # Factory Managers Daily Report
+      #  5761346,
+      #  5771040,
+      #  5356418,
+      #  5500213,
+      #  5404597,
+    }
+)
 
 
 def safe_str(value):
@@ -95,20 +104,6 @@ def parse_time_value(value):
     return None
 
 
-def get_form_ids_for_process(cursor, process_name):
-    cursor.execute(
-        """
-        SELECT form_id
-        FROM dbo.gocanvas_form_registry
-        WHERE etl_process_name = ?
-          AND is_active = 1
-        ORDER BY form_id
-        """,
-        process_name,
-    )
-    return [row[0] for row in cursor.fetchall()]
-
-
 def get_form_last_run(cursor, form_id):
     cursor.execute(
         """
@@ -126,22 +121,17 @@ def fetch_submissions_for_form(session, form_id, created_after=None):
     page = 1
 
     while True:
-        params = {
-            "form_id": form_id,
-            "page": page,
-            "per_page": 100,
-        }
+        params = {"form_id": form_id, "page": page, "per_page": 100}
         if created_after:
             params["created_after"] = created_after
 
         response = session.get(f"{BASE_URL}/submissions", params=params, timeout=60)
-
         if response.status_code != 200:
             print(
                 f"❌ Failed to fetch submissions for form {form_id}, "
                 f"status={response.status_code}"
             )
-            print(response.text[:500])
+            print(response.text[:300])
             break
 
         data = response.json()
@@ -156,7 +146,7 @@ def fetch_submissions_for_form(session, form_id, created_after=None):
         if not batch:
             break
 
-        # Hard exact-form filter in case GoCanvas returns mixed lineage/family results
+        # hard exact-form filter
         batch = [s for s in batch if s.get("form_id") == form_id]
 
         submissions.extend(batch)
@@ -171,20 +161,19 @@ def fetch_submissions_for_form(session, form_id, created_after=None):
 
 def fetch_submission_detail(session, submission_id):
     response = session.get(f"{BASE_URL}/submissions/{submission_id}", timeout=60)
-
     if response.status_code != 200:
         print(
             f"❌ Failed to fetch detail for submission {submission_id}, "
             f"status={response.status_code}"
         )
-        print(response.text[:500])
+        print(response.text[:300])
         return None
-
     return response.json()
 
 
 def build_response_rows(detail, fallback_form_id=None, debug_response_keys=False):
     response_rows = []
+    debug_logged = False
 
     if not isinstance(detail, dict):
         return response_rows
@@ -197,11 +186,12 @@ def build_response_rows(detail, fallback_form_id=None, debug_response_keys=False
         print(f"⚠ Skipping submission because id/form_id missing: {sub_id}, {form_id}")
         return response_rows
 
-    if debug_response_keys and responses:
+    if debug_response_keys and responses and not debug_logged:
         sample = responses[0]
         if isinstance(sample, str):
             sample = json.loads(sample)
         print("DEBUG response keys:", sorted(sample.keys()))
+        debug_logged = True
 
     for r in responses:
         if isinstance(r, str):
@@ -299,24 +289,16 @@ def print_row_length_warnings(response_rows):
         ) = row
 
         if field_type and len(str(field_type)) > 100:
-            print(
-                f"⚠ field_type too long | response_id={response_id} | len={len(str(field_type))}"
-            )
+            print(f"⚠ field_type too long | response_id={response_id} | len={len(str(field_type))}")
 
         if label and len(str(label)) > 500:
-            print(
-                f"⚠ label too long | response_id={response_id} | len={len(str(label))}"
-            )
+            print(f"⚠ label too long | response_id={response_id} | len={len(str(label))}")
 
         if export_label and len(str(export_label)) > 500:
-            print(
-                f"⚠ export_label too long | response_id={response_id} | len={len(str(export_label))}"
-            )
+            print(f"⚠ export_label too long | response_id={response_id} | len={len(str(export_label))}")
 
         if multi_key and len(str(multi_key)) > 200:
-            print(
-                f"⚠ multi_key too long | response_id={response_id} | len={len(str(multi_key))}"
-            )
+            print(f"⚠ multi_key too long | response_id={response_id} | len={len(str(multi_key))}")
 
 
 run_id = None
@@ -351,14 +333,6 @@ try:
     cursor = conn.cursor()
     cursor.fast_executemany = True
     print("✅ Connected to SQL Server")
-
-    FORM_IDS = get_form_ids_for_process(cursor, PROCESS_NAME)
-    print(f"✅ Forms configured for {PROCESS_NAME}: {FORM_IDS}")
-
-    if not FORM_IDS:
-        raise Exception(
-            f"No active forms found in dbo.gocanvas_form_registry for {PROCESS_NAME}"
-        )
 
     cursor.execute(
         """
@@ -399,7 +373,7 @@ try:
             created_after=created_after,
         )
 
-        # Extra safety filter in Python
+        # python-side safety filter
         if created_after:
             before_count = len(form_submissions)
             form_submissions = [
@@ -754,13 +728,10 @@ try:
         f"✅ Responses merged | inserted={responses_inserted}, updated={responses_updated}"
     )
 
-    if FACT_PROC:
-        print(f"Running stored procedure: {FACT_PROC}...")
-        cursor.execute(f"EXEC {FACT_PROC}")
-        conn.commit()
-        print("✅ Stored procedure executed successfully")
-    else:
-        print("✅ No post-load stored procedure configured")
+    print(f"Running stored procedure: {FACT_PROC}...")
+    cursor.execute(f"EXEC {FACT_PROC}")
+    conn.commit()
+    print("✅ Stored procedure executed successfully")
 
     cursor.execute(
         """
