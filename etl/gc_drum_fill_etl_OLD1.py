@@ -1,7 +1,7 @@
 # =========================================
 # GoCanvas Drum Fill ETL Script
 # Author: Michael Hulley
-# Date: 2026-04-13
+# Date: 2026-04-01
 # Description:
 #   Extracts GoCanvas submissions and responses
 #   for active DrumFill forms defined in
@@ -10,19 +10,24 @@
 #       dbo.stg_gocanvas_submission
 #       dbo.stg_gocanvas_response
 #
-#   Incremental load logic:
-#   - Reads last_created_after_utc from dbo.etl_process_control
-#   - Applies a 1-day overlap buffer
-#   - Upserts submission headers
-#   - Deletes/reloads responses for touched submissions
-#   - Updates watermark on successful completion
+#   Main GoCanvas endpoints used:
+#
+#   1) List submissions for a form lineage / family
+#      GET /api/v3/submissions?form_id=<form_id>&page=<page>&per_page=<per_page>
+#
+#   2) Get full submission detail
+#      GET /api/v3/submissions/<submission_id>
+#
+#   Notes:
+#   - Uses form registry instead of hard-coded FORM_IDS
+#   - Applies exact form_id filtering after API fetch
+#   - Useful when GoCanvas returns mixed versions in one lineage
 # =========================================
 
 import json
 import os
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import datetime
 
 import pyodbc
 import requests
@@ -43,20 +48,20 @@ SQL_PASSWORD = os.getenv("SQL_PASSWORD")
 BASE_URL = "https://www.gocanvas.com/api/v3"
 
 PROCESS_AREA = "DrumFill"
-ETL_PROCESS_NAME = "gc_drum_fill_etl.py"
+ETL_PROCESS_NAME = "gc_drum_fill_etl.py"   # optional extra filter
 
-DEFAULT_CREATED_AFTER = "2025-01-01T00:00:00Z"
+# Optional GoCanvas submission list filters
+CREATED_AFTER = "2025-01-01T00:00:00Z"
 CREATED_BEFORE = None
 
 PER_PAGE = 100
 REQUEST_TIMEOUT = 60
 SLEEP_BETWEEN_CALLS = 0.15
-OVERLAP_HOURS = 6
 
 DEBUG_RESPONSE_KEYS = False
 PRINT_SUBMISSION_LIST = True
 
-# Set to integer like 5 for testing, or None for full load
+# Set to an integer like 5 for testing, or None for full load
 TEST_LIMIT = None
 
 # =========================
@@ -71,30 +76,15 @@ responses_inserted = 0
 responses_deleted = 0
 submission_errors = 0
 
-# =========================
-# GLOBALS
-# =========================
-conn: Optional[pyodbc.Connection] = None
-cursor: Optional[pyodbc.Cursor] = None
-session: Optional[requests.Session] = None
+conn = None
+cursor = None
+session = None
 
 
 # =========================
-# HELPERS
+# DB CONNECTION
 # =========================
-def require_env() -> None:
-    required = {
-        "SQL_SERVER": SQL_SERVER,
-        "SQL_DB/SQL_DATABASE": SQL_DB,
-        "SQL_USER/SQL_USERNAME": SQL_USER,
-        "SQL_PASSWORD": SQL_PASSWORD,
-    }
-    missing = [k for k, v in required.items() if not v]
-    if missing:
-        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
-
-
-def get_sql_connection() -> pyodbc.Connection:
+def get_sql_connection():
     conn_str = (
         f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={SQL_SERVER};"
@@ -108,18 +98,14 @@ def get_sql_connection() -> pyodbc.Connection:
     return pyodbc.connect(conn_str)
 
 
-def get_form_ids_from_registry(
-    db_cursor: pyodbc.Cursor,
-    process_area: str,
-    etl_process_name: Optional[str] = None,
-) -> list[int]:
+def get_form_ids_from_registry(cursor, process_area, etl_process_name=None):
     sql = """
         SELECT form_id
         FROM dbo.gocanvas_form_registry
         WHERE process_area = ?
           AND is_active = 1
     """
-    params: list[Any] = [process_area]
+    params = [process_area]
 
     if etl_process_name:
         sql += " AND etl_process_name = ?"
@@ -127,117 +113,14 @@ def get_form_ids_from_registry(
 
     sql += " ORDER BY form_id"
 
-    db_cursor.execute(sql, params)
-    return [row[0] for row in db_cursor.fetchall()]
-
-
-def ensure_etl_control_row(db_cursor: pyodbc.Cursor, process_name: str) -> None:
-    db_cursor.execute(
-        """
-        IF NOT EXISTS (
-            SELECT 1
-            FROM dbo.etl_process_control
-            WHERE process_name = ?
-        )
-        INSERT INTO dbo.etl_process_control
-        (
-            process_name,
-            last_successful_run_utc,
-            last_created_after_utc,
-            last_status,
-            last_message,
-            updated_at_utc
-        )
-        VALUES (?, NULL, NULL, NULL, NULL, SYSUTCDATETIME())
-        """,
-        process_name,
-        process_name,
-    )
-
-
-def get_last_created_after(db_cursor: pyodbc.Cursor, process_name: str) -> Optional[datetime]:
-    db_cursor.execute(
-        """
-        SELECT last_created_after_utc
-        FROM dbo.etl_process_control
-        WHERE process_name = ?
-        """,
-        process_name,
-    )
-    row = db_cursor.fetchone()
-    return row[0] if row and row[0] else None
-
-
-def update_etl_status(
-    db_cursor: pyodbc.Cursor,
-    process_name: str,
-    status: str,
-    message: Optional[str] = None,
-    last_created_after_utc: Optional[datetime] = None,
-    success: bool = False,
-) -> None:
-    if success and last_created_after_utc is not None:
-        db_cursor.execute(
-            """
-            UPDATE dbo.etl_process_control
-            SET
-                last_successful_run_utc = SYSUTCDATETIME(),
-                last_created_after_utc = ?,
-                last_status = ?,
-                last_message = ?,
-                updated_at_utc = SYSUTCDATETIME()
-            WHERE process_name = ?
-            """,
-            last_created_after_utc,
-            status,
-            message,
-            process_name,
-        )
-    else:
-        db_cursor.execute(
-            """
-            UPDATE dbo.etl_process_control
-            SET
-                last_status = ?,
-                last_message = ?,
-                updated_at_utc = SYSUTCDATETIME()
-            WHERE process_name = ?
-            """,
-            status,
-            message,
-            process_name,
-        )
-
-
-def resolve_created_after(db_cursor: pyodbc.Cursor, process_name: str) -> str:
-    last_created_after = get_last_created_after(db_cursor, process_name)
-
-    if not last_created_after:
-        return DEFAULT_CREATED_AFTER
-
-    if last_created_after.tzinfo is None:
-        last_created_after = last_created_after.replace(tzinfo=timezone.utc)
-
-    created_after_dt = last_created_after - timedelta(hours=OVERLAP_HOURS)
-    return created_after_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def parse_api_datetime(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    text = value.strip()
-    if not text:
-        return None
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+    cursor.execute(sql, params)
+    return [row[0] for row in cursor.fetchall()]
 
 
 # =========================
 # API SESSION
 # =========================
-def get_session(token: str) -> requests.Session:
+def get_session(token):
     s = requests.Session()
     s.headers.update(
         {
@@ -248,8 +131,7 @@ def get_session(token: str) -> requests.Session:
     return s
 
 
-def api_get(url: str, params: Optional[dict[str, Any]] = None) -> Any:
-    assert session is not None
+def api_get(url, params=None):
     response = session.get(url, params=params, timeout=REQUEST_TIMEOUT)
     response.raise_for_status()
     return response.json()
@@ -258,20 +140,20 @@ def api_get(url: str, params: Optional[dict[str, Any]] = None) -> Any:
 # =========================
 # ENDPOINT: LIST SUBMISSIONS
 # =========================
-def get_submission_list_page(form_id: int, page: int, created_after: Optional[str]) -> Any:
-    params: dict[str, Any] = {
+def get_submission_list_page(form_id, page):
+    params = {
         "form_id": form_id,
         "page": page,
         "per_page": PER_PAGE,
     }
 
-    if created_after:
-        params["created_after"] = created_after
+    if CREATED_AFTER:
+        params["created_after"] = CREATED_AFTER
 
     if CREATED_BEFORE:
         params["created_before"] = CREATED_BEFORE
 
-    print("\nCalling submissions list endpoint...")
+    print("\n📡 Calling submissions list endpoint...")
     print(f"   GET {BASE_URL}/submissions")
     print(f"   Request params: {params}")
 
@@ -279,12 +161,12 @@ def get_submission_list_page(form_id: int, page: int, created_after: Optional[st
     return api_get(url, params=params)
 
 
-def get_all_submission_summaries(form_id: int, created_after: Optional[str]) -> list[dict[str, Any]]:
-    all_items: list[dict[str, Any]] = []
+def get_all_submission_summaries(form_id):
+    all_items = []
     page = 1
 
     while True:
-        payload = get_submission_list_page(form_id, page, created_after)
+        payload = get_submission_list_page(form_id, page)
 
         if isinstance(payload, dict):
             raw_items = payload.get("items") or payload.get("submissions") or payload.get("data") or []
@@ -293,6 +175,7 @@ def get_all_submission_summaries(form_id: int, created_after: Optional[str]) -> 
         else:
             raw_items = []
 
+        # Hard exact-form filter
         items = [x for x in raw_items if x.get("form_id") == form_id]
 
         if not raw_items:
@@ -306,7 +189,7 @@ def get_all_submission_summaries(form_id: int, created_after: Optional[str]) -> 
         )
 
         if PRINT_SUBMISSION_LIST and raw_items:
-            print("   Raw form_ids returned:", sorted({x.get("form_id") for x in raw_items}))
+            print("   Raw form_ids returned:", sorted({x.get('form_id') for x in raw_items}))
 
         if len(raw_items) < PER_PAGE:
             break
@@ -320,7 +203,7 @@ def get_all_submission_summaries(form_id: int, created_after: Optional[str]) -> 
 # =========================
 # ENDPOINT: SUBMISSION DETAIL
 # =========================
-def get_submission_detail(submission_id: Any) -> Any:
+def get_submission_detail(submission_id):
     submission_id = str(submission_id).strip()
     url = f"{BASE_URL}/submissions/{submission_id}"
     return api_get(url)
@@ -329,7 +212,7 @@ def get_submission_detail(submission_id: Any) -> Any:
 # =========================
 # VALUE PARSERS
 # =========================
-def parse_numeric(field_type: Optional[str], value: Any) -> Optional[float]:
+def parse_numeric(field_type, value):
     if value is None:
         return None
 
@@ -342,14 +225,16 @@ def parse_numeric(field_type: Optional[str], value: Any) -> Optional[float]:
 
     try:
         num = float(text)
+
         if abs(num) >= 1000000000000:
             return None
+
         return num
     except ValueError:
         return None
 
 
-def parse_date_value(field_type: Optional[str], value: Any) -> Optional[datetime.date]:
+def parse_date_value(field_type, value):
     if value is None or field_type != "Date":
         return None
 
@@ -366,7 +251,7 @@ def parse_date_value(field_type: Optional[str], value: Any) -> Optional[datetime
     return None
 
 
-def parse_time_value(field_type: Optional[str], value: Any) -> Optional[datetime.time]:
+def parse_time_value(field_type, value):
     if value is None or field_type != "Time":
         return None
 
@@ -386,9 +271,8 @@ def parse_time_value(field_type: Optional[str], value: Any) -> Optional[datetime
 # =========================
 # SQL STAGING LOAD: SUBMISSION HEADER
 # =========================
-def upsert_submission(sub: dict[str, Any]) -> None:
+def upsert_submission(sub):
     global submissions_inserted, submissions_updated
-    assert cursor is not None
 
     cursor.execute(
         """
@@ -464,9 +348,8 @@ def upsert_submission(sub: dict[str, Any]) -> None:
 # =========================
 # SQL STAGING LOAD: RESPONSE DELETE
 # =========================
-def delete_existing_submission_responses(submission_id: Any) -> None:
+def delete_existing_submission_responses(submission_id):
     global responses_deleted
-    assert cursor is not None
 
     cursor.execute(
         "DELETE FROM dbo.stg_gocanvas_response WHERE submission_id = ?",
@@ -478,9 +361,8 @@ def delete_existing_submission_responses(submission_id: Any) -> None:
 # =========================
 # SQL STAGING LOAD: RESPONSE DETAIL
 # =========================
-def insert_response_row(submission: dict[str, Any], response: dict[str, Any], response_ordinal: int) -> None:
+def insert_response_row(submission, response, response_ordinal):
     global responses_inserted
-    assert cursor is not None
 
     response_value = response.get("value")
     field_type = response.get("type")
@@ -534,7 +416,7 @@ def insert_response_row(submission: dict[str, Any], response: dict[str, Any], re
     responses_inserted += 1
 
 
-def load_submission_and_responses(submission: dict[str, Any]) -> None:
+def load_submission_and_responses(submission):
     global responses_fetched_count
 
     upsert_submission(submission)
@@ -553,12 +435,12 @@ def load_submission_and_responses(submission: dict[str, Any]) -> None:
     responses_fetched_count += len(responses)
 
 
-def print_multi_key_summary(submission: dict[str, Any]) -> None:
+def print_multi_key_summary(submission):
     responses = submission.get("responses", []) or []
 
     header_count = 0
     detail_count = 0
-    multi_keys: set[str] = set()
+    multi_keys = set()
 
     for r in responses:
         mk = r.get("multi_key")
@@ -579,55 +461,34 @@ def print_multi_key_summary(submission: dict[str, Any]) -> None:
 # =========================
 # MAIN
 # =========================
-def main() -> None:
-    global conn, cursor, session
-    global submissions_fetched_count, submissions_after_filter_count, submission_errors
-
-    require_env()
-
+try:
     token = get_access_token()
-    print("Access token retrieved")
+    print("✅ Access token retrieved")
 
     conn = get_sql_connection()
     cursor = conn.cursor()
     session = get_session(token)
 
-    ensure_etl_control_row(cursor, ETL_PROCESS_NAME)
-    conn.commit()
-
-    created_after = resolve_created_after(cursor, ETL_PROCESS_NAME)
-    print(f"Using CREATED_AFTER = {created_after}")
-
-    update_etl_status(
-        cursor,
-        ETL_PROCESS_NAME,
-        status="RUNNING",
-        message=f"Started incremental load from {created_after}",
-    )
-    conn.commit()
-
-    form_ids = get_form_ids_from_registry(
-        db_cursor=cursor,
+    FORM_IDS = get_form_ids_from_registry(
+        cursor=cursor,
         process_area=PROCESS_AREA,
         etl_process_name=ETL_PROCESS_NAME,
     )
 
-    print(f"Active forms from registry for {PROCESS_AREA}: {form_ids}")
+    print(f"✅ Active forms from registry for {PROCESS_AREA}: {FORM_IDS}")
 
-    if not form_ids:
+    if not FORM_IDS:
         raise Exception(
             f"No active forms found in dbo.gocanvas_form_registry "
             f"for process_area={PROCESS_AREA}, etl_process_name={ETL_PROCESS_NAME}"
         )
 
-    max_created_at: Optional[datetime] = None
-
-    for form_id in form_ids:
+    for form_id in FORM_IDS:
         print("\n" + "=" * 80)
         print(f"Processing form_id={form_id}")
         print("=" * 80)
 
-        submission_summaries = get_all_submission_summaries(form_id, created_after)
+        submission_summaries = get_all_submission_summaries(form_id)
         submissions_fetched_count += len(submission_summaries)
 
         if PRINT_SUBMISSION_LIST:
@@ -652,18 +513,10 @@ def main() -> None:
             if not submission_id:
                 continue
 
-            item_created_at = parse_api_datetime(item.get("created_at"))
-            if item_created_at and (max_created_at is None or item_created_at > max_created_at):
-                max_created_at = item_created_at
-
             try:
-                print(f"\nFetching submission detail for ID: {submission_id}")
+                print(f"\n📄 Fetching submission detail for ID: {submission_id}")
                 print(f"   GET {BASE_URL}/submissions/{submission_id}")
                 submission = get_submission_detail(submission_id)
-
-                detail_created_at = parse_api_datetime(submission.get("created_at"))
-                if detail_created_at and (max_created_at is None or detail_created_at > max_created_at):
-                    max_created_at = detail_created_at
 
                 load_submission_and_responses(submission)
                 print_multi_key_summary(submission)
@@ -673,39 +526,7 @@ def main() -> None:
             except Exception as sub_err:
                 submission_errors += 1
                 conn.rollback()
-                print(f"Error on submission_id={submission_id}: {sub_err}")
-
-    if max_created_at is None:
-        last_created_after = get_last_created_after(cursor, ETL_PROCESS_NAME)
-        if last_created_after is not None:
-            max_created_at = last_created_after
-
-    if max_created_at is not None:
-        if max_created_at.tzinfo is None:
-            max_created_at = max_created_at.replace(tzinfo=timezone.utc)
-        max_created_at = max_created_at.astimezone(timezone.utc).replace(tzinfo=None)
-
-        update_etl_status(
-            cursor,
-            ETL_PROCESS_NAME,
-            status="SUCCESS",
-            message=(
-                f"Loaded submissions={submissions_after_filter_count}, "
-                f"errors={submission_errors}"
-            ),
-            last_created_after_utc=max_created_at,
-            success=True,
-        )
-    else:
-        update_etl_status(
-            cursor,
-            ETL_PROCESS_NAME,
-            status="SUCCESS",
-            message="No submissions returned; watermark unchanged",
-            success=False,
-        )
-
-    conn.commit()
+                print(f"❌ Error on submission_id={submission_id}: {sub_err}")
 
     print("\n" + "=" * 80)
     print("LOAD SUMMARY")
@@ -717,32 +538,16 @@ def main() -> None:
     print(f"submissions_updated            = {submissions_updated}")
     print(f"responses_inserted             = {responses_inserted}")
     print(f"responses_deleted              = {responses_deleted}")
-    print(f"submission_errors              = {submission_errors}")
-    print(f"max_created_at                 = {max_created_at}")
+    print(f"submission_errors             = {submission_errors}")
 
+except Exception as e:
+    print(f"\n❌ FATAL ERROR: {e}")
+    if conn:
+        conn.rollback()
+    raise
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"\nFATAL ERROR: {e}")
-        if conn:
-            try:
-                if cursor:
-                    update_etl_status(
-                        cursor,
-                        ETL_PROCESS_NAME,
-                        status="FAILED",
-                        message=str(e)[:1000],
-                        success=False,
-                    )
-                    conn.commit()
-            except Exception:
-                pass
-            conn.rollback()
-        raise
-    finally:
-        if cursor:
-            cursor.close()
-        if conn:
-            conn.close()
+finally:
+    if cursor:
+        cursor.close()
+    if conn:
+        conn.close()

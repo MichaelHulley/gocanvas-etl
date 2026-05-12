@@ -1,4 +1,3 @@
-# =========================================
 # GoCanvas Drum Fill ETL Script
 # Author: Michael Hulley
 # Date: 2026-04-13
@@ -51,7 +50,7 @@ CREATED_BEFORE = None
 PER_PAGE = 100
 REQUEST_TIMEOUT = 60
 SLEEP_BETWEEN_CALLS = 0.15
-OVERLAP_HOURS = 6
+OVERLAP_DAYS = 1
 
 DEBUG_RESPONSE_KEYS = False
 PRINT_SUBMISSION_LIST = True
@@ -218,7 +217,7 @@ def resolve_created_after(db_cursor: pyodbc.Cursor, process_name: str) -> str:
     if last_created_after.tzinfo is None:
         last_created_after = last_created_after.replace(tzinfo=timezone.utc)
 
-    created_after_dt = last_created_after - timedelta(hours=OVERLAP_HOURS)
+    created_after_dt = last_created_after - timedelta(days=OVERLAP_DAYS)
     return created_after_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 

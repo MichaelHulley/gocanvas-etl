@@ -16,3 +16,6 @@ venv/
 
 # VS Code
 *.log
+*.csv 
+*_OLD.py 
+.env 

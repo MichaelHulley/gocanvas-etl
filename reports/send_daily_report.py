@@ -142,7 +142,14 @@ def fetch_report_data(report_date: date) -> tuple[pd.DataFrame, pd.DataFrame]:
         df_header = (
             resultsets[0]
             if len(resultsets) > 0
-            else pd.DataFrame(columns=["report_date", "week_start_date", "month_start_date", "year_start_date"])
+            else pd.DataFrame(
+                columns=[
+                    "report_date",
+                    "week_start_date",
+                    "month_start_date",
+                    "production_year_start_date",
+                ]
+            )
         )
 
         df_report = (
@@ -354,8 +361,7 @@ def build_html(header: dict, df_report: pd.DataFrame) -> str:
     report_date = header.get("report_date", "")
     week_start = header.get("week_start_date", "")
     month_start = header.get("month_start_date", "")
-    year_start = header.get("year_start_date", "")
-
+    year_start = (header.get("production_year_start_date", "") or header.get("year_start_date", ""))
     email_intro_html = format_email_intro(EMAIL_INTRO, EMAIL_INTRO_2)
     email_signoff_html = format_email_signoff(EMAIL_SIGNOFF, EMAIL_SIGNATURE)
     report_table_html = build_report_table_html(df_report)
@@ -482,7 +488,7 @@ def build_html(header: dict, df_report: pd.DataFrame) -> str:
                 &nbsp;&nbsp;|&nbsp;&nbsp;
                 <strong>Month Start:</strong> {escape(month_start)}
                 &nbsp;&nbsp;|&nbsp;&nbsp;
-                <strong>Year Start:</strong> {escape(year_start)}
+                <strong>Production Year Start:</strong> {escape(year_start)}
             </div>
 
             <div class="message-block">
@@ -527,8 +533,12 @@ def send_email(subject: str, html: str) -> None:
 # =========================
 def main() -> None:
     report_date = get_report_date()
+ 
     print(f"Running factory report for {report_date}")
-
+    print("SQL_SERVER:", SQL_SERVER)
+    print("SQL_DATABASE:", SQL_DATABASE)
+    print("REPORT_DATE env:", os.getenv("REPORT_DATE"))
+ 
     df_header, df_report = fetch_report_data(report_date)
     df_report = clean_report_df(df_report)
 
@@ -545,14 +555,14 @@ def main() -> None:
             "report_date": format_date_value(header_row.get("report_date")),
             "week_start_date": format_date_value(header_row.get("week_start_date")),
             "month_start_date": format_date_value(header_row.get("month_start_date")),
-            "year_start_date": format_date_value(header_row.get("year_start_date")),
+            "year_start_date": format_date_value(header_row.get("production_year_start_date")),
         }
 
     subject = f"{EMAIL_SUBJECT_PREFIX}🏭 Factory Daily Report - {header['report_date']}"
     html = build_html(header, df_report)
 
     send_email(subject, html)
-    print("✅ Email sent successfully!")
+    print("Email sent successfully!")
 
 
 if __name__ == "__main__":
