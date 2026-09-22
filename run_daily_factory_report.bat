@@ -1,42 +1,53 @@
 @echo off
 setlocal
 
-cd /d C:\Users\mrdhulley\PythonProjects\GoCanvas_API
+chcp 65001 > nul
+set PYTHONIOENCODING=utf-8
+
+cd /d C:\PythonProjects\GoCanvas_API
 
 if not exist logs mkdir logs
 
-REM Build safe timestamp for unique log file
-set YYYY=%date:~-4%
-set MM=%date:~3,2%
-set DD=%date:~0,2%
-set HH=%time:~0,2%
-set HH=%HH: =0%
-set MIN=%time:~3,2%
-set SEC=%time:~6,2%
-
-set LOGFILE=logs\daily_factory_report_%YYYY%%MM%%DD%_%HH%%MIN%%SEC%.log
+for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"') do set TIMESTAMP=%%i
+set LOGFILE=logs\daily_factory_report_%TIMESTAMP%.log
 
 call venv\Scripts\activate.bat
 
 echo ========================================== >> %LOGFILE%
-echo Starting Knightshade daily load and report >> %LOGFILE%
+echo Starting Knightshade daily load and reports >> %LOGFILE%
 echo START_TIME=%date% %time% >> %LOGFILE%
 echo ========================================== >> %LOGFILE%
 
-echo Running Intake ETL... >> %LOGFILE%
-python etl\gc_intake_etl.py >> %LOGFILE% 2>&1
+echo Downloading Factory Reporting files from SharePoint... >> %LOGFILE%
+python etl\graph_download_factory_reports.py >> %LOGFILE% 2>&1
 if errorlevel 1 goto fail
 
-echo Running Drum Fill ETL... >> %LOGFILE%
-python etl\gc_drum_fill_etl.py >> %LOGFILE% 2>&1
+echo Loading Drum Report Excel into SQL staging... >> %LOGFILE%
+python etl\excel_load_drum_report.py >> %LOGFILE% 2>&1
+if errorlevel 1 goto fail
+
+echo Loading Bin Tipping Report Excel into SQL staging... >> %LOGFILE%
+python etl\excel_load_bin_tipping_report.py >> %LOGFILE% 2>&1
+if errorlevel 1 goto fail
+
+echo Loading Rerun Report Excel into SQL staging... >> %LOGFILE%
+python etl\excel_load_rerun_report.py >> %LOGFILE% 2>&1
+if errorlevel 1 goto fail
+
+echo Refreshing GoCanvas form registry... >> %LOGFILE%
+python etl\gc_refresh_form_registry.py >> %LOGFILE% 2>&1
+if errorlevel 1 goto fail
+
+echo Running Intake ETL... >> %LOGFILE%
+python etl\gc_intake_etl.py >> %LOGFILE% 2>&1
 if errorlevel 1 goto fail
 
 echo Running Shift Report ETL... >> %LOGFILE%
 python etl\gc_shift_report_etl.py >> %LOGFILE% 2>&1
 if errorlevel 1 goto fail
 
-echo Sending Daily Report... >> %LOGFILE%
-python reports\send_daily_report.py >> %LOGFILE% 2>&1
+echo Sending Factory Series Report... >> %LOGFILE%
+python reports\send_daily_series_report.py >> %LOGFILE% 2>&1
 if errorlevel 1 goto fail
 
 echo ========================================== >> %LOGFILE%
@@ -45,16 +56,16 @@ echo END_TIME=%date% %time% >> %LOGFILE%
 echo ========================================== >> %LOGFILE%
 
 echo Logging run status to SQL... >> %LOGFILE%
-python monitoring\parse_daily_log_to_sql.py >> %LOGFILE% 2>&1
-
+python monitoring\parse_daily_log_to_sql.py "%LOGFILE%" >> %LOGFILE% 2>&1
 exit /b 0
+
 :fail
 echo ========================================== >> %LOGFILE%
 echo FAILED >> %LOGFILE%
 echo END_TIME=%date% %time% >> %LOGFILE%
 echo ========================================== >> %LOGFILE%
 
-echo Logging failed run status to SQL... >> %LOGFILE%
-python monitoring\parse_daily_log_to_sql.py >> %LOGFILE% 2>&1
+echo Logging run status to SQL... >> %LOGFILE%
+python monitoring\parse_daily_log_to_sql.py "%LOGFILE%" >> %LOGFILE% 2>&1
 
 exit /b 1

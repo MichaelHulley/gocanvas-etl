@@ -1,6 +1,4 @@
 @echo off
-cd /d C:\Users\mrdhulley\PythonProjects\GoCanvas_API
-
+cd /d C:\PythonProjects\GoCanvas_API
 call venv\Scripts\activate
-
-python reports\send_daily_report.py >> logs\daily_report.log 2>&1
+python .\reports\send_daily_report.py >> C:\PythonProjects\GoCanvas_API\daily_report_log.txt 2>&1

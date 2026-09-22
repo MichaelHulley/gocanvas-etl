@@ -40,7 +40,7 @@ SQL_PASSWORD = os.getenv("SQL_PASSWORD")
 
 BASE_URL = "https://www.gocanvas.com/api/v3"
 PROCESS_NAME = "gc_intake_etl.py"
-FACT_PROC = None
+FACT_PROC = "dbo.usp_load_fact_tomato_intake"
 LIMIT = None
 DEBUG_RESPONSE_KEYS = False
 
@@ -397,6 +397,16 @@ def fetch_submissions_for_form(
 
         filtered_batch = [s for s in batch if s.get("form_id") == form_id]
 
+        if created_after:
+            cutoff = parse_api_datetime(created_after)
+
+            if cutoff:
+                filtered_batch = [
+                    s for s in filtered_batch
+                    if parse_api_datetime(s.get("created_at"))
+                    and parse_api_datetime(s.get("created_at")) >= cutoff
+                ]
+
         if DEBUG_LIST_ENDPOINT:
             print(f"Filtered batch count: {len(filtered_batch)}")
 
@@ -693,8 +703,8 @@ def merge_responses(db_cursor: pyodbc.Cursor, response_rows: list[tuple]) -> Non
             form_id INT NOT NULL,
             entry_id BIGINT NULL,
             field_type NVARCHAR(100) NULL,
-            label NVARCHAR(500) NULL,
-            export_label NVARCHAR(500) NULL,
+            label NVARCHAR(1000) NULL,
+            export_label NVARCHAR(1000) NULL,
             displayed BIT NULL,
             value_text NVARCHAR(MAX) NULL,
             value_numeric DECIMAL(18,6) NULL,
@@ -862,7 +872,7 @@ def main() -> None:
 
     conn = get_sql_connection()
     cursor = conn.cursor()
-    cursor.fast_executemany = True
+    cursor.fast_executemany = False
     print("Connected to SQL Server")
 
     ensure_etl_control_row(cursor, PROCESS_NAME)
@@ -919,6 +929,16 @@ def main() -> None:
             deduped[sid] = s
 
     all_submissions = list(deduped.values())
+
+    if created_after:
+        cutoff = parse_api_datetime(created_after)
+
+        if cutoff:
+            all_submissions = [
+                s for s in all_submissions
+                if parse_api_datetime(s.get("created_at"))
+                and parse_api_datetime(s.get("created_at")) >= cutoff
+            ]
 
     if LIMIT:
         all_submissions = all_submissions[:LIMIT]

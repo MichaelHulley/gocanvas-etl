@@ -1,21 +1,57 @@
-# Python
-__pycache__/
-*.pyc
+# ==========================================
+# Knightshade - Git exclusions
+# ==========================================
 
-# Virtual environment
-venv/
-
-# Secrets
+# Secrets / environment
 .env
+.env.*
+env secret.txt
+*.secret
+*.key
+*.pem
 
-# Logs
-*.log
+# Python virtual environment
+venv/
+.venv/
 
-# Dev / temp
-*.json
+# Python generated files
+__pycache__/
+*.py[cod]
+*$py.class
 
 # VS Code
+.vscode/
+
+# Logs / runtime output
+logs/
 *.log
-*.csv 
-*_OLD.py 
-.env 
+
+# Operational data files
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# Temporary files
+*.tmp
+*.download
+~$*
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Runtime text logs
+*_log.txt
+
+# Manual backup copies
+* bak.*
+*.bak
+
+/GoCanvas_API/
+
+# Server administration utility - not part of Knightshade
+HULLSERV_Inventory.ps1
+
+# GitHub recovery codes
+github-recovery-codes*.txt

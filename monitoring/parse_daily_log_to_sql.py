@@ -10,6 +10,8 @@ from datetime import datetime
 import pyodbc
 from dotenv import load_dotenv
 
+import sys
+
 load_dotenv()
 
 # =========================
@@ -56,22 +58,35 @@ def get_latest_log_file(folder: str) -> str:
 # DATE PARSING
 # =========================
 def parse_bat_datetime(value: str):
-    """
-    Parses BAT timestamps like:
-    02/05/2026 11:43:19.75
-    02/05/2026 11:43:19
-    """
     if not value:
         return None
 
     value = value.strip()
 
+    # Handle: Sat 05/16/2026 10:21:30.02
+    parts = value.split()
+
+    if len(parts) == 3:
+        # Remove weekday
+        value = f"{parts[1]} {parts[2]}"
+
     # Remove decimal seconds
     if "." in value:
         value = value.split(".")[0]
 
-    return datetime.strptime(value, "%d/%m/%Y %H:%M:%S")
+    # Try both ZA and US formats
+    formats = [
+        "%m/%d/%Y %H:%M:%S",
+        "%d/%m/%Y %H:%M:%S"
+    ]
 
+    for fmt in formats:
+        try:
+            return datetime.strptime(value, fmt)
+        except ValueError:
+            pass
+
+    return None
 
 # =========================
 # STATUS HELPERS
@@ -136,6 +151,16 @@ def parse_log(file_path: str) -> dict:
         "LOAD SUMMARY"
     )
 
+    bin_tipping_status = "NOT RUN"
+
+    if "Loading Bin Tipping Report Excel into SQL staging" in content:
+        if "rows into dbo.stg_bin_tipping_report" in content:
+            bin_tipping_status = "SUCCESS"
+        else:
+            bin_tipping_status = "FAILED"
+
+
+
     shift_status = detect_step_status(
         content,
         "Running Shift Report ETL",
@@ -149,10 +174,10 @@ def parse_log(file_path: str) -> dict:
     )
 
     # Overall status
-    if "FAILED" in content:
-        overall_status = "FAILED"
-    elif "Completed successfully" in content and end_time is not None:
+    if "Completed successfully" in content and end_time is not None:
         overall_status = "SUCCESS"
+    elif "\nFAILED" in content or " FAILED " in content:
+        overall_status = "FAILED"
     else:
         overall_status = "FAILED"
 
@@ -171,6 +196,7 @@ def parse_log(file_path: str) -> dict:
         "overall_status": overall_status,
         "intake_status": intake_status,
         "drum_fill_status": drum_fill_status,
+        "bin_tipping_status": bin_tipping_status,
         "shift_status": shift_status,
         "email_status": email_status,
         "runtime_minutes": runtime_minutes,
@@ -204,12 +230,13 @@ def load_to_sql(data: dict) -> None:
             overall_status,
             intake_status,
             drum_fill_status,
+            bin_tipping_status,
             shift_report_status,
             email_status,
             total_runtime_minutes,
             last_message
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         data["log_file_name"],
         data["run_started_at"],
@@ -217,6 +244,7 @@ def load_to_sql(data: dict) -> None:
         data["overall_status"],
         data["intake_status"],
         data["drum_fill_status"],
+        data["bin_tipping_status"],
         data["shift_status"],
         data["email_status"],
         data["runtime_minutes"],
@@ -233,7 +261,10 @@ def load_to_sql(data: dict) -> None:
 # =========================
 if __name__ == "__main__":
     try:
-        log_file = get_latest_log_file(LOG_FOLDER)
+        if len(sys.argv) > 1:
+            log_file = sys.argv[1]
+        else:
+            log_file = get_latest_log_file(LOG_FOLDER)
         parsed = parse_log(log_file)
 
         print("Parsed log:")
